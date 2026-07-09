@@ -1,0 +1,308 @@
+name: Partner PR Release Automation
+
+on:
+  workflow_call:
+    secrets:
+      JIRA_WEBHOOK_URL:
+        required: true
+        description: "Azure Function App webhook URL for CreateJiraCM"
+
+jobs:
+  process-upgrade-pr:
+    runs-on: ubuntu-latest
+    # Only run for release/upgrade PRs
+    if: startsWith(github.head_ref, 'release/') || startsWith(github.head_ref, 'upgrade/')
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Check for merge conflicts
+        id: conflict_check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Poll GitHub API until mergeable status is determined
+          for i in {1..10}; do
+            RESPONSE=$(gh api "/repos/$REPO/pulls/$PR_NUMBER" --jq '.mergeable,.mergeable_state')
+            MERGEABLE=$(echo "$RESPONSE" | head -1)
+            STATE=$(echo "$RESPONSE" | tail -1)
+            
+            if [ "$MERGEABLE" != "null" ]; then
+              break
+            fi
+            sleep 2
+          done
+          
+          echo "mergeable=$MERGEABLE" >> $GITHUB_OUTPUT
+          echo "state=$STATE" >> $GITHUB_OUTPUT
+          
+          if [ "$MERGEABLE" = "false" ]; then
+            echo "has_conflicts=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_conflicts=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Notify about merge conflicts and stop
+        if: steps.conflict_check.outputs.has_conflicts == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_CREATOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          CONFLICT_MSG=$(cat <<'EOF'
+          ## ⚠️ Merge Conflicts Detected
+          
+          This PR has merge conflicts that must be resolved before the CM ticket can be created.
+          
+          **Next Steps:**
+          1. Pull the latest changes from the target branch
+          2. Resolve all conflicts locally
+          3. Push the resolved changes
+          
+          The automation will re-run once conflicts are resolved.
+          EOF
+          )
+          
+          gh pr comment "$PR_NUMBER" --body "$CONFLICT_MSG"
+          gh pr edit "$PR_NUMBER" --add-label "has-conflicts"
+          
+          # TODO: Send email to PR creator
+          echo "Merge conflicts detected. Workflow stopped."
+          exit 1
+      
+      - name: Parse PR metadata
+        id: meta
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          REPO_NAME: ${{ github.repository }}
+          PR_CREATOR_EMAIL: ${{ github.event.pull_request.user.email }}
+        run: |
+          # Extract fields from PR body
+          SUMMARY=$(echo "$PR_BODY" | sed -n '/\*\*Release Summary:\*\*/,/\*\*Changed Web Central Applications:\*\*/p' | sed '1d;$d' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -1)
+          APPS=$(echo "$PR_BODY" | sed -n '/\*\*Changed Web Central Applications:\*\*/,/\*\*Submitter Name:\*\*/p' | sed '1d;$d' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -1)
+          NAME=$(echo "$PR_BODY" | sed -n 's/.*\*\*Submitter Name:\*\*[[:space:]]*\(.*\)/\1/p' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -1)
+          EMAIL=$(echo "$PR_BODY" | sed -n 's/.*\*\*Submitter Email:\*\*[[:space:]]*\(.*\)/\1/p' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -1)
+          PHONE=$(echo "$PR_BODY" | sed -n 's/.*\*\*Submitter Phone:\*\*[[:space:]]*\(.*\)/\1/p' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -1)
+          
+          # Derive hdnClientName from repo name
+          HDN_CLIENT=$(echo "$REPO_NAME" | cut -d'/' -f2)
+          
+          # Use PR creator email if not provided in body
+          if [ -z "$EMAIL" ]; then
+            EMAIL="${PR_CREATOR_EMAIL:-no-email-provided}"
+          fi
+          
+          # Validate required fields
+          MISSING_FIELDS=""
+          if [ -z "$SUMMARY" ]; then
+            MISSING_FIELDS="${MISSING_FIELDS}Release Summary, "
+          fi
+          if [ -z "$APPS" ]; then
+            MISSING_FIELDS="${MISSING_FIELDS}Changed Web Central Applications, "
+          fi
+          if [ -z "$EMAIL" ] || [ "$EMAIL" = "no-email-provided" ]; then
+            MISSING_FIELDS="${MISSING_FIELDS}Submitter Email, "
+          fi
+          
+          # Remove trailing comma and space
+          MISSING_FIELDS=$(echo "$MISSING_FIELDS" | sed 's/, $//')
+          
+          if [ -n "$MISSING_FIELDS" ]; then
+            echo "validation_failed=true" >> $GITHUB_OUTPUT
+            echo "missing_fields=$MISSING_FIELDS" >> $GITHUB_OUTPUT
+          else
+            echo "validation_failed=false" >> $GITHUB_OUTPUT
+          fi
+          
+          # Write outputs
+          echo "summary=$SUMMARY" >> $GITHUB_OUTPUT
+          echo "apps=$APPS" >> $GITHUB_OUTPUT
+          echo "submitter_name=$NAME" >> $GITHUB_OUTPUT
+          echo "submitter_email=$EMAIL" >> $GITHUB_OUTPUT
+          echo "submitter_phone=$PHONE" >> $GITHUB_OUTPUT
+          echo "hdn_client=$HDN_CLIENT" >> $GITHUB_OUTPUT
+      
+      - name: Post validation failure comment
+        if: steps.meta.outputs.validation_failed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          MISSING: ${{ steps.meta.outputs.missing_fields }}
+        run: |
+          TEMPLATE=$(cat <<'EOF'
+          ## ❌ PR Description Incomplete
+          
+          The following required fields are missing: **$MISSING**
+          
+          Please update your PR description with the following format:
+          
+          ---
+          
+          ## Release Information
+          
+          **Release Summary:**
+          <!-- Brief description of what's changing -->
+          
+          **Changed Web Central Applications:**
+          <!-- List the apps being updated, e.g. Admin, Reporting, Workspace Reservations -->
+          
+          **Submitter Name:**
+          
+          **Submitter Email:**
+          
+          **Submitter Phone:**
+          
+          ## Details
+          <!-- Additional context, screenshots, etc. -->
+          
+          ---
+          
+          Once you've updated the PR description, the automation will re-run automatically.
+          EOF
+          )
+          
+          # Replace $MISSING placeholder
+          TEMPLATE=$(echo "$TEMPLATE" | sed "s/\$MISSING/$MISSING/")
+          
+          gh pr comment "$PR_NUMBER" --body "$TEMPLATE"
+          gh pr edit "$PR_NUMBER" --add-label "needs-info"
+          
+          echo "Validation failed. Workflow stopped."
+          exit 1
+      
+      - name: Calculate due date
+        id: due_date
+        run: |
+          # Due date = today + 3 business days
+          SLA_DAYS=3
+          DUE_DATE=$(date -d "+${SLA_DAYS} days" +%Y-%m-%d)
+          echo "due_date=$DUE_DATE" >> $GITHUB_OUTPUT
+      
+      - name: Create CM ticket via function app
+        id: create_cm
+        env:
+          WEBHOOK_URL: ${{ secrets.JIRA_WEBHOOK_URL }}
+          HDN_CLIENT: ${{ steps.meta.outputs.hdn_client }}
+          SUMMARY: ${{ steps.meta.outputs.summary }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          DUE_DATE: ${{ steps.due_date.outputs.due_date }}
+        run: |
+          # Build CM description
+          CM_DESCRIPTION=$(cat <<EOF
+          **Partner Release Request**
+          
+          **PR:** $PR_URL
+          **Repository:** ${{ github.repository }}
+          **Branch:** ${{ github.head_ref }} → ${{ github.base_ref }}
+          **Submitter:** ${{ steps.meta.outputs.submitter_name }} <${{ steps.meta.outputs.submitter_email }}>
+          **Phone:** ${{ steps.meta.outputs.submitter_phone }}
+          
+          **Release Summary:**
+          $SUMMARY
+          
+          **Changed Applications:**
+          ${{ steps.meta.outputs.apps }}
+          
+          **Full PR Description:**
+          $PR_BODY
+          EOF
+          )
+          
+          # Call CreateJiraCM function app
+          PAYLOAD=$(jq -n \
+            --arg summary      "[AUTO] $HDN_CLIENT - $PR_TITLE - $(date +%Y-%m-%d)" \
+            --arg description  "$CM_DESCRIPTION" \
+            --arg priority     "Medium" \
+            --arg hdnClientName "$HDN_CLIENT" \
+            --arg issueType    "Change" \
+            --arg duedate      "$DUE_DATE" \
+            '{summary:$summary, description:$description, priority:$priority,
+              hdnClientName:$hdnClientName, issueType:$issueType, duedate:$duedate, labels:["CloudOps","PartnerPR"]}')
+          
+          RESPONSE=$(curl -s -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+          
+          echo "Response: $RESPONSE"
+          
+          # Extract CM key from response (e.g. "CM-1234 created successfully")
+          CM_KEY=$(echo "$RESPONSE" | grep -oP 'CM-\d+')
+          
+          if [ -z "$CM_KEY" ]; then
+            echo "❌ Failed to extract CM ticket key from response"
+            echo "$RESPONSE"
+            exit 1
+          fi
+          
+          CM_URL="https://condecosoftware.atlassian.net/browse/$CM_KEY"
+          echo "cm_key=$CM_KEY" >> $GITHUB_OUTPUT
+          echo "cm_url=$CM_URL" >> $GITHUB_OUTPUT
+          
+          echo "✅ CM ticket created: $CM_KEY"
+      
+      - name: Write to Azure Storage Table (cm_email_map)
+        id: store_mapping
+        env:
+          CM_KEY: ${{ steps.create_cm.outputs.cm_key }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          EMAIL: ${{ steps.meta.outputs.submitter_email }}
+          NAME: ${{ steps.meta.outputs.submitter_name }}
+          PHONE: ${{ steps.meta.outputs.submitter_phone }}
+        run: |
+          # TODO: Write to Azure Storage Table
+          # This requires Azure CLI or REST API call
+          # For now, just log the data that should be stored
+          
+          echo "Would store in Azure Table:"
+          echo "PartitionKey: CM"
+          echo "RowKey: $CM_KEY"
+          echo "cm_ticket_id: $CM_KEY"
+          echo "pr_number: $PR_NUMBER"
+          echo "pr_url: $PR_URL"
+          echo "submitter_email: $EMAIL"
+          echo "submitter_name: $NAME"
+          echo "submitter_phone: $PHONE"
+          echo "environment: $(echo '${{ github.base_ref }}' | grep -q 'staging' && echo 'UAT' || echo 'PROD')"
+          echo "notification_sent: false"
+          echo "deployment_status: pending"
+          echo "created_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          
+          # TODO: Implement actual Azure Table Storage write
+          # az storage entity insert \
+          #   --account-name <storage-account> \
+          #   --table-name cm_email_map \
+          #   --entity PartitionKey=CM RowKey=$CM_KEY ...
+      
+      - name: Post CM ticket URL as comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          CM_KEY: ${{ steps.create_cm.outputs.cm_key }}
+          CM_URL: ${{ steps.create_cm.outputs.cm_url }}
+        run: |
+          SUCCESS_MSG=$(cat <<EOF
+          ## ✅ CM Ticket Created
+          
+          Your release request has been processed successfully.
+          
+          **CM Ticket:** [$CM_KEY]($CM_URL)
+          
+          **Next Steps:**
+          1. The CloudOps team has been notified and is working on your request
+          2. You will receive an email notification once the deployment is complete
+          3. Please verify the changes in your environment after deployment
+          
+          If you have any questions, reference ticket **$CM_KEY** in your support case.
+          EOF
+          )
+          
+          gh pr comment "$PR_NUMBER" --body "$SUCCESS_MSG"
+      
+      # Email notification to partner is handled by the runbook (post-deployment).
