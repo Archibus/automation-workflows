@@ -10,8 +10,8 @@ on:
 jobs:
   process-upgrade-pr:
     runs-on: ubuntu-latest
-    # Only run for upgrade PRs: source branch ending in -development going to -staging, -release, or -development (for testing)
-    if: endsWith(github.head_ref, '-development') && (endsWith(github.base_ref, '-staging') || endsWith(github.base_ref, '-release') || endsWith(github.base_ref, '-development'))
+    # Only run when target branch is -staging, -release, or -development (for testing)
+    if: endsWith(github.base_ref, '-staging') || endsWith(github.base_ref, '-release') || endsWith(github.base_ref, '-development')
     
     steps:
       - name: Checkout
