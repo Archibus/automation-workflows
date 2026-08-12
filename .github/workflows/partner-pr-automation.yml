@@ -72,9 +72,8 @@ jobs:
             echo "Set repository secret JIRA_WEBHOOK_URL in Archibus/isquared (or pass it via workflow_call)."
             exit 1
           fi
-          # Client name = target branch with -staging / -release suffix stripped (xyz-staging -> xyz).
-          # If the branch has neither suffix, the full branch name is used as-is (for testing).
-          CLIENT_NAME=$(echo "$BASE_REF" | sed -E 's/-(staging|release)$//')
+          # Send full target branch name as clientName.
+          CLIENT_NAME="$BASE_REF"
           RUN_DATE=$(date -u +%Y-%m-%d)
           
           echo "Client: $CLIENT_NAME | Date: $RUN_DATE"
