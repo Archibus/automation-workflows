@@ -67,6 +67,11 @@ jobs:
           WEBHOOK_URL: ${{ secrets.JIRA_WEBHOOK_URL }}
           BASE_REF: ${{ github.base_ref }}
         run: |
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo "::error::Missing required secret JIRA_WEBHOOK_URL in the caller repository."
+            echo "Set repository secret JIRA_WEBHOOK_URL in Archibus/isquared (or pass it via workflow_call)."
+            exit 1
+          fi
           # Client name = target branch with -staging / -release suffix stripped (xyz-staging -> xyz).
           # If the branch has neither suffix, the full branch name is used as-is (for testing).
           CLIENT_NAME=$(echo "$BASE_REF" | sed -E 's/-(staging|release)$//')
@@ -78,7 +83,17 @@ jobs:
             --arg clientName "$CLIENT_NAME" \
             --arg date       "$RUN_DATE" \
             '{clientName:$clientName, date:$date}')
-          
-          curl -s -X POST "$WEBHOOK_URL" \
+
+          RESPONSE_FILE=$(mktemp)
+          HTTP_CODE=$(curl -sS -o "$RESPONSE_FILE" -w "%{http_code}" -X POST "$WEBHOOK_URL" \
             -H "Content-Type: application/json" \
-            -d "$PAYLOAD"
+            -d "$PAYLOAD")
+
+          echo "Runbook HTTP status: $HTTP_CODE"
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "::error::Runbook webhook call failed with HTTP $HTTP_CODE"
+            cat "$RESPONSE_FILE"
+            exit 1
+          fi
+
+          cat "$RESPONSE_FILE"
