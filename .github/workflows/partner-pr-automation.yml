@@ -2,28 +2,152 @@ name: Partner PR Release Automation
 
 on:
   workflow_call:
+    inputs:
+      config_path:
+        required: false
+        type: string
+        default: ""
+        description: "Deprecated: ignored in centralized mode"
+      central_config_path:
+        required: false
+        type: string
+        default: config/partner-pr-automation-central-config.json
+        description: "Path to centralized PR automation JSON config in automation-workflows"
+      central_config_ref:
+        required: false
+        type: string
+        default: master
+        description: "Branch, tag, or SHA used to read centralized config"
+      central_config_repository:
+        required: false
+        type: string
+        default: Archibus/automation-workflows
+        description: "Repository containing centralized PR automation config"
     secrets:
       JIRA_WEBHOOK_URL:
         required: true
         description: "Azure Function App webhook URL for CreateJiraCM"
+      CENTRAL_CONFIG_TOKEN:
+        required: false
+        description: "Optional token with read access to centralized config repository"
 
 jobs:
   process-upgrade-pr:
     runs-on: ubuntu-latest
-    # Only run when target branch is -staging or -release
-    # TODO: Re-enable branch gating after testing.
-    # if: endsWith(github.base_ref, '-staging') || endsWith(github.base_ref, '-release')
-    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+      - name: Load automation config
+        id: config
+        env:
+          CENTRAL_CONFIG_PATH: ${{ inputs.central_config_path }}
+          CENTRAL_CONFIG_REF: ${{ inputs.central_config_ref }}
+          CENTRAL_CONFIG_REPOSITORY: ${{ inputs.central_config_repository }}
+          CENTRAL_CONFIG_TOKEN: ${{ secrets.CENTRAL_CONFIG_TOKEN }}
+          FALLBACK_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CENTRAL_CONFIG_PATH" ]; then
+            CENTRAL_CONFIG_PATH="config/partner-pr-automation-central-config.json"
+          fi
+
+          AUTH_TOKEN="$CENTRAL_CONFIG_TOKEN"
+          if [ -z "$AUTH_TOKEN" ]; then
+            AUTH_TOKEN="$FALLBACK_TOKEN"
+          fi
+
+          CONFIG_B64=$(GH_TOKEN="$AUTH_TOKEN" gh api \
+            "repos/$CENTRAL_CONFIG_REPOSITORY/contents/$CENTRAL_CONFIG_PATH?ref=$CENTRAL_CONFIG_REF" \
+            --jq '.content')
+          CONFIG_JSON=$(echo "$CONFIG_B64" | tr -d '\n' | base64 -d)
+
+          echo "Using centralized config: $CENTRAL_CONFIG_REPOSITORY/$CENTRAL_CONFIG_PATH@$CENTRAL_CONFIG_REF"
+
+          if ! echo "$CONFIG_JSON" | jq -e . >/dev/null 2>&1; then
+            echo "::error::Invalid centralized config JSON at $CENTRAL_CONFIG_REPOSITORY/$CENTRAL_CONFIG_PATH@$CENTRAL_CONFIG_REF"
+            exit 1
+          fi
+
+          ENABLED=$(echo "$CONFIG_JSON" | jq -r --arg repo "$REPO" '
+            if (.enabled_repositories // [] | length) == 0
+            then "false"
+            else ((.enabled_repositories | index($repo)) != null | tostring)
+            end
+          ')
+          REPO_ALLOWED=$(echo "$CONFIG_JSON" | jq -r --arg repo "$REPO" '
+            ((.enabled_repositories // []) | index($repo)) != null | tostring
+          ')
+          BLOCKED_CREATORS_JSON=$(echo "$CONFIG_JSON" | jq -c --arg repo "$REPO" '
+            if (.repository_overrides[$repo].blocked_pr_creators? != null)
+            then (.repository_overrides[$repo].blocked_pr_creators)
+            else (.default_blocked_pr_creators // [])
+            end
+          ')
+          ALLOWED_BASE_BRANCH_PATTERNS_JSON=$(echo "$CONFIG_JSON" | jq -c --arg repo "$REPO" '
+            if (.repository_overrides[$repo].allowed_base_branch_patterns? != null)
+            then (.repository_overrides[$repo].allowed_base_branch_patterns)
+            else (.allowed_base_branch_patterns // ["*-staging"])
+            end
+          ')
+          BLOCKED_PR_CREATOR=$(echo "$BLOCKED_CREATORS_JSON" | jq -r --arg actor "$PR_AUTHOR" '
+            (map(ascii_downcase) | index($actor | ascii_downcase)) != null
+          ')
+          BASE_BRANCH_ALLOWED="false"
+          while IFS= read -r PATTERN; do
+            if [ -n "$PATTERN" ] && [[ "$BASE_REF" == $PATTERN ]]; then
+              BASE_BRANCH_ALLOWED="true"
+              break
+            fi
+          done < <(echo "$ALLOWED_BASE_BRANCH_PATTERNS_JSON" | jq -r '.[]')
+
+          SHOULD_RUN="true"
+          SKIP_REASON=""
+
+          if [ "$ENABLED" != "true" ]; then
+            SHOULD_RUN="false"
+            SKIP_REASON="Repository $REPO is not enabled in centralized config."
+          elif [ "$REPO_ALLOWED" != "true" ]; then
+            SHOULD_RUN="false"
+            SKIP_REASON="Repository $REPO is not in enabled_repositories."
+          elif [ "$BASE_BRANCH_ALLOWED" != "true" ]; then
+            SHOULD_RUN="false"
+            SKIP_REASON="Base branch $BASE_REF is not allowed by centralized config."
+          elif [ "$BLOCKED_PR_CREATOR" = "true" ]; then
+            SHOULD_RUN="false"
+            SKIP_REASON="PR creator $PR_AUTHOR is blocked by centralized config."
+          fi
+
+          {
+            echo "enabled=$ENABLED"
+            echo "repo_allowed=$REPO_ALLOWED"
+            echo "blocked_pr_creator=$BLOCKED_PR_CREATOR"
+            echo "blocked_creators_json=$BLOCKED_CREATORS_JSON"
+            echo "allowed_base_branch_patterns_json=$ALLOWED_BASE_BRANCH_PATTERNS_JSON"
+            echo "base_branch_allowed=$BASE_BRANCH_ALLOWED"
+            echo "should_run=$SHOULD_RUN"
+            echo "skip_reason=$SKIP_REASON"
+          } >> "$GITHUB_OUTPUT"
+      - name: Skip automation when disabled or blocked
+        if: steps.config.outputs.should_run != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SKIP_REASON: ${{ steps.config.outputs.skip_reason }}
+        run: |
+          echo "$SKIP_REASON"
+          gh pr comment "$PR_NUMBER" --body "⏭️ PR automation skipped: $SKIP_REASON"
       - name: Check for merge conflicts
+        if: steps.config.outputs.should_run == 'true'
         id: conflict_check
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
+          set -euo pipefail
           # Poll GitHub API until mergeable status is determined
           MERGEABLE="null"
           for i in {1..10}; do
@@ -41,7 +165,7 @@ jobs:
           fi
       
       - name: Stop if merge conflicts
-        if: steps.conflict_check.outputs.has_conflicts == 'true'
+        if: steps.config.outputs.should_run == 'true' && steps.conflict_check.outputs.has_conflicts == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -53,7 +177,7 @@ jobs:
           exit 1
       
       - name: Merge PR
-        if: steps.conflict_check.outputs.has_conflicts == 'false'
+        if: steps.config.outputs.should_run == 'true' && steps.conflict_check.outputs.has_conflicts == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -62,26 +186,43 @@ jobs:
           echo "✅ PR merged."
       
       - name: Create CM ticket via runbook
-        if: steps.conflict_check.outputs.has_conflicts == 'false'
+        if: steps.config.outputs.should_run == 'true' && steps.conflict_check.outputs.has_conflicts == 'false'
         env:
           WEBHOOK_URL: ${{ secrets.JIRA_WEBHOOK_URL }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_CREATED_AT: ${{ github.event.pull_request.created_at }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
         run: |
+          set -euo pipefail
           if [ -z "$WEBHOOK_URL" ]; then
             echo "::error::Missing required secret JIRA_WEBHOOK_URL in the caller repository."
             echo "Set repository secret JIRA_WEBHOOK_URL in Archibus/isquared (or pass it via workflow_call)."
             exit 1
           fi
-          # Send full target branch name as clientName.
-          CLIENT_NAME="$BASE_REF"
-          RUN_DATE=$(date -u +%Y-%m-%d)
-          
-          echo "Client: $CLIENT_NAME | Date: $RUN_DATE"
+          echo "PR: $PR_URL"
+          echo "Created: $PR_CREATED_AT | Base: $BASE_REF | Merged branch: $HEAD_REF"
           
           PAYLOAD=$(jq -n \
-            --arg clientName "$CLIENT_NAME" \
-            --arg date       "$RUN_DATE" \
-            '{clientName:$clientName, date:$date}')
+            --arg prUrl      "$PR_URL" \
+            --arg prCreatedAt "$PR_CREATED_AT" \
+            --arg baseRef    "$BASE_REF" \
+            --arg headRef    "$HEAD_REF" \
+            --arg repository "$REPO" \
+            --arg prNumber   "$PR_NUMBER" \
+            --arg prAuthor   "$PR_AUTHOR" \
+            '{
+              prLink:$prUrl,
+              prCreatedAt:$prCreatedAt,
+              baseBranch:$baseRef,
+              mergedBranch:$headRef,
+              repository:$repository,
+              prNumber:$prNumber,
+              prAuthor:$prAuthor
+            }')
 
           RESPONSE_FILE=$(mktemp)
           HTTP_CODE=$(curl -sS -o "$RESPONSE_FILE" -w "%{http_code}" -X POST "$WEBHOOK_URL" \

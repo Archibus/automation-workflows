@@ -1,0 +1,24 @@
+{
+  "enabled_repositories": [
+    "Archibus/isquared",
+    "Archibus/ai-webcentral",
+    "Archibus/cbre"
+  ],
+  "allowed_base_branch_patterns": [
+    "*-staging"
+  ],
+  "default_blocked_pr_creators": [
+    "dependabot[bot]",
+    "some-user-to-ignore"
+  ],
+  "repository_overrides": {
+    "Archibus/ai-webcentral": {
+      "blocked_pr_creators": [
+        "release-bot"
+      ],
+      "allowed_base_branch_patterns": [
+        "*-staging"
+      ]
+    }
+  }
+}
