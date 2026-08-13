@@ -2,7 +2,8 @@
   "enabled_repositories": [
     "Archibus/isquared",
     "Archibus/ai-webcentral",
-    "Archibus/cbre"
+    "Archibus/cbre",
+    "Archibus/oracle-db-docker"
   ],
   "allowed_base_branch_patterns": [
     "*-staging"
