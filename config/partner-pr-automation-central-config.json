@@ -9,8 +9,7 @@
     "*-staging"
   ],
   "default_blocked_pr_creators": [
-    "dependabot[bot]",
-    "Shobhitmishraeptura"
+    "dependabot[bot]"
   ],
   "repository_overrides": {}
 }
